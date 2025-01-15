@@ -1,5 +1,20 @@
 ## Releases
 
+## 2.2.3
+- Fixed an issue where proxy username and password were not handled correctly [#1799](https://github.com/actions/toolkit/pull/1799)
+
+## 2.2.2
+- Better handling of url encoded usernames and passwords in proxy config [#1782](https://github.com/actions/toolkit/pull/1782)
+
+## 2.2.1
+- Make sure RequestOptions.keepAlive is applied properly on node20 runtime [#1572](https://github.com/actions/toolkit/pull/1572)
+
+## 2.2.0
+- Add function to return proxy agent dispatcher for compatibility with latest octokit packages [#1547](https://github.com/actions/toolkit/pull/1547)
+
+## 2.1.1
+- Add `HttpClientResponse.readBodyBuffer` method to read from a response stream and return a buffer [#1475](https://github.com/actions/toolkit/pull/1475)
+
 ## 2.1.0
 - Add support for `*` and subdomains in `no_proxy` [#1355](https://github.com/actions/toolkit/pull/1355) [#1223](https://github.com/actions/toolkit/pull/1223)
 - Bypass proxy for loopback IP adresses [#1360](https://github.com/actions/toolkit/pull/1360))

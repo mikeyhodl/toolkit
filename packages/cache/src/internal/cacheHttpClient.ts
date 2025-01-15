@@ -5,12 +5,10 @@ import {
   RequestOptions,
   TypedResponse
 } from '@actions/http-client/lib/interfaces'
-import * as crypto from 'crypto'
 import * as fs from 'fs'
 import {URL} from 'url'
-
 import * as utils from './cacheUtils'
-import {CompressionMethod} from './constants'
+import {uploadCacheArchiveSDK} from './uploadUtils'
 import {
   ArtifactCacheEntry,
   InternalCacheOptions,
@@ -20,7 +18,11 @@ import {
   ITypedResponseWithError,
   ArtifactCacheList
 } from './contracts'
-import {downloadCacheHttpClient, downloadCacheStorageSDK} from './downloadUtils'
+import {
+  downloadCacheHttpClient,
+  downloadCacheHttpClientConcurrent,
+  downloadCacheStorageSDK
+} from './downloadUtils'
 import {
   DownloadOptions,
   UploadOptions,
@@ -32,11 +34,11 @@ import {
   retryHttpClientResponse,
   retryTypedResponse
 } from './requestUtils'
-
-const versionSalt = '1.0'
+import {getCacheServiceURL} from './config'
+import {getUserAgentString} from './shared/user-agent'
 
 function getCacheApiUrl(resource: string): string {
-  const baseUrl: string = process.env['ACTIONS_CACHE_URL'] || ''
+  const baseUrl: string = getCacheServiceURL()
   if (!baseUrl) {
     throw new Error('Cache Service Url not found, unable to restore cache.')
   }
@@ -65,37 +67,10 @@ function createHttpClient(): HttpClient {
   const bearerCredentialHandler = new BearerCredentialHandler(token)
 
   return new HttpClient(
-    'actions/cache',
+    getUserAgentString(),
     [bearerCredentialHandler],
     getRequestOptions()
   )
-}
-
-export function getCacheVersion(
-  paths: string[],
-  compressionMethod?: CompressionMethod,
-  enableCrossOsArchive = false
-): string {
-  const components = paths
-
-  // Add compression method to cache version to restore
-  // compressed cache as per compression method
-  if (compressionMethod) {
-    components.push(compressionMethod)
-  }
-
-  // Only check for windows platforms if enableCrossOsArchive is false
-  if (process.platform === 'win32' && !enableCrossOsArchive) {
-    components.push('windows-only')
-  }
-
-  // Add salt to cache version to support breaking changes in cache entry
-  components.push(versionSalt)
-
-  return crypto
-    .createHash('sha256')
-    .update(components.join('|'))
-    .digest('hex')
 }
 
 export async function getCacheEntry(
@@ -104,11 +79,12 @@ export async function getCacheEntry(
   options?: InternalCacheOptions
 ): Promise<ArtifactCacheEntry | null> {
   const httpClient = createHttpClient()
-  const version = getCacheVersion(
+  const version = utils.getCacheVersion(
     paths,
     options?.compressionMethod,
     options?.enableCrossOsArchive
   )
+
   const resource = `cache?keys=${encodeURIComponent(
     keys.join(',')
   )}&version=${version}`
@@ -174,14 +150,26 @@ export async function downloadCache(
   const archiveUrl = new URL(archiveLocation)
   const downloadOptions = getDownloadOptions(options)
 
-  if (
-    downloadOptions.useAzureSdk &&
-    archiveUrl.hostname.endsWith('.blob.core.windows.net')
-  ) {
-    // Use Azure storage SDK to download caches hosted on Azure to improve speed and reliability.
-    await downloadCacheStorageSDK(archiveLocation, archivePath, downloadOptions)
+  if (archiveUrl.hostname.endsWith('.blob.core.windows.net')) {
+    if (downloadOptions.useAzureSdk) {
+      // Use Azure storage SDK to download caches hosted on Azure to improve speed and reliability.
+      await downloadCacheStorageSDK(
+        archiveLocation,
+        archivePath,
+        downloadOptions
+      )
+    } else if (downloadOptions.concurrentBlobDownloads) {
+      // Use concurrent implementation with HttpClient to work around blob SDK issue
+      await downloadCacheHttpClientConcurrent(
+        archiveLocation,
+        archivePath,
+        downloadOptions
+      )
+    } else {
+      // Otherwise, download using the Actions http-client.
+      await downloadCacheHttpClient(archiveLocation, archivePath)
+    }
   } else {
-    // Otherwise, download using the Actions http-client.
     await downloadCacheHttpClient(archiveLocation, archivePath)
   }
 }
@@ -193,7 +181,7 @@ export async function reserveCache(
   options?: InternalCacheOptions
 ): Promise<ITypedResponseWithError<ReserveCacheResponse>> {
   const httpClient = createHttpClient()
-  const version = getCacheVersion(
+  const version = utils.getCacheVersion(
     paths,
     options?.compressionMethod,
     options?.enableCrossOsArchive
@@ -230,9 +218,9 @@ async function uploadChunk(
   end: number
 ): Promise<void> {
   core.debug(
-    `Uploading chunk of size ${end -
-      start +
-      1} bytes at offset ${start} with content range: ${getContentRange(
+    `Uploading chunk of size ${
+      end - start + 1
+    } bytes at offset ${start} with content range: ${getContentRange(
       start,
       end
     )}`
@@ -339,26 +327,45 @@ async function commitCache(
 export async function saveCache(
   cacheId: number,
   archivePath: string,
+  signedUploadURL?: string,
   options?: UploadOptions
 ): Promise<void> {
-  const httpClient = createHttpClient()
+  const uploadOptions = getUploadOptions(options)
 
-  core.debug('Upload cache')
-  await uploadFile(httpClient, cacheId, archivePath, options)
+  if (uploadOptions.useAzureSdk) {
+    // Use Azure storage SDK to upload caches directly to Azure
+    if (!signedUploadURL) {
+      throw new Error(
+        'Azure Storage SDK can only be used when a signed URL is provided.'
+      )
+    }
+    await uploadCacheArchiveSDK(signedUploadURL, archivePath, options)
+  } else {
+    const httpClient = createHttpClient()
 
-  // Commit Cache
-  core.debug('Commiting cache')
-  const cacheSize = utils.getArchiveFileSizeInBytes(archivePath)
-  core.info(
-    `Cache Size: ~${Math.round(cacheSize / (1024 * 1024))} MB (${cacheSize} B)`
-  )
+    core.debug('Upload cache')
+    await uploadFile(httpClient, cacheId, archivePath, options)
 
-  const commitCacheResponse = await commitCache(httpClient, cacheId, cacheSize)
-  if (!isSuccessStatusCode(commitCacheResponse.statusCode)) {
-    throw new Error(
-      `Cache service responded with ${commitCacheResponse.statusCode} during commit cache.`
+    // Commit Cache
+    core.debug('Commiting cache')
+    const cacheSize = utils.getArchiveFileSizeInBytes(archivePath)
+    core.info(
+      `Cache Size: ~${Math.round(
+        cacheSize / (1024 * 1024)
+      )} MB (${cacheSize} B)`
     )
-  }
 
-  core.info('Cache saved successfully')
+    const commitCacheResponse = await commitCache(
+      httpClient,
+      cacheId,
+      cacheSize
+    )
+    if (!isSuccessStatusCode(commitCacheResponse.statusCode)) {
+      throw new Error(
+        `Cache service responded with ${commitCacheResponse.statusCode} during commit cache.`
+      )
+    }
+
+    core.info('Cache saved successfully')
+  }
 }
